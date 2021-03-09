@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::default::Default;
+use std::marker::PhantomData;
 
 use actix_web::dev::{Payload, ServiceRequest};
 use actix_web::http::header::Header;
@@ -9,7 +10,7 @@ use actix_web::{FromRequest, HttpRequest};
 use futures_util::future::{ready, Ready};
 
 use super::config::AuthExtractorConfig;
-use super::errors::AuthenticationError;
+use super::errors::{AuthenticationError, CompleteErrorResponse, DefaultErrorResponse};
 use super::AuthExtractor;
 use crate::headers::authorization;
 use crate::headers::www_authenticate::bearer;
@@ -17,15 +18,18 @@ pub use crate::headers::www_authenticate::bearer::Error;
 
 /// [BearerAuth](./struct/BearerAuth.html) extractor configuration.
 #[derive(Debug, Clone, Default)]
-pub struct Config(bearer::Bearer);
+pub struct Config<B: CompleteErrorResponse = DefaultErrorResponse>(
+    bearer::Bearer,
+    PhantomData<B>,
+);
 
-impl Config {
+impl<B: CompleteErrorResponse> Config<B> {
     /// Set challenge `scope` attribute.
     ///
     /// The `"scope"` attribute is a space-delimited list of case-sensitive
     /// scope values indicating the required scope of the access token for
     /// accessing the requested resource.
-    pub fn scope<T: Into<Cow<'static, str>>>(mut self, value: T) -> Config {
+    pub fn scope<T: Into<Cow<'static, str>>>(mut self, value: T) -> Self {
         self.0.scope = Some(value.into());
         self
     }
@@ -34,20 +38,21 @@ impl Config {
     ///
     /// The "realm" attribute indicates the scope of protection in the manner
     /// described in HTTP/1.1 [RFC2617](https://tools.ietf.org/html/rfc2617#section-1.2).
-    pub fn realm<T: Into<Cow<'static, str>>>(mut self, value: T) -> Config {
+    pub fn realm<T: Into<Cow<'static, str>>>(mut self, value: T) -> Self {
         self.0.realm = Some(value.into());
         self
     }
 }
 
-impl AsRef<bearer::Bearer> for Config {
+impl<B: CompleteErrorResponse> AsRef<bearer::Bearer> for Config<B> {
     fn as_ref(&self) -> &bearer::Bearer {
         &self.0
     }
 }
 
-impl AuthExtractorConfig for Config {
+impl<B: CompleteErrorResponse> AuthExtractorConfig for Config<B> {
     type Inner = bearer::Bearer;
+    type Builder = B;
 
     fn into_inner(self) -> Self::Inner {
         self.0
@@ -76,7 +81,7 @@ impl AuthExtractorConfig for Config {
 ///
 /// ```
 /// use actix_web::{web, App};
-/// use actix_web_httpauth::extractors::bearer::{BearerAuth, Config};
+/// use actix_web_httpauth::extractors::bearer::BearerAuth;
 ///
 /// async fn index(auth: BearerAuth) -> String {
 ///     format!("Hello, {}!", auth.token())
@@ -85,7 +90,7 @@ impl AuthExtractorConfig for Config {
 /// fn main() {
 ///     let app = App::new()
 ///         .data(
-///             Config::default()
+///             <BearerAuth>::default_config()
 ///                 .realm("Restricted area")
 ///                 .scope("email photo"),
 ///         )
@@ -93,19 +98,27 @@ impl AuthExtractorConfig for Config {
 /// }
 /// ```
 #[derive(Debug, Clone)]
-pub struct BearerAuth(authorization::Bearer);
+pub struct BearerAuth<B: CompleteErrorResponse = DefaultErrorResponse>(
+    authorization::Bearer,
+    PhantomData<B>,
+);
 
-impl BearerAuth {
+impl<B: CompleteErrorResponse> BearerAuth<B> {
     /// Returns bearer token provided by client.
     pub fn token(&self) -> &str {
         self.0.token()
     }
+
+    /// Returns the default bearer configuraion
+    pub fn default_config() -> <Self as FromRequest>::Config {
+        <Self as FromRequest>::Config::default()
+    }
 }
 
-impl FromRequest for BearerAuth {
-    type Config = Config;
+impl<B: CompleteErrorResponse> FromRequest for BearerAuth<B> {
+    type Config = Config<B>;
     type Future = Ready<Result<Self, Self::Error>>;
-    type Error = AuthenticationError<bearer::Bearer>;
+    type Error = AuthenticationError<Self::Config>;
 
     fn from_request(
         req: &HttpRequest,
@@ -113,41 +126,24 @@ impl FromRequest for BearerAuth {
     ) -> <Self as FromRequest>::Future {
         ready(
             authorization::Authorization::<authorization::Bearer>::parse(req)
-                .map(|auth| BearerAuth(auth.into_scheme()))
-                .map_err(|_| {
-                    let bearer = req
-                        .app_data::<Self::Config>()
-                        .map(|config| config.0.clone())
-                        .unwrap_or_else(Default::default);
-
-                    AuthenticationError::new(bearer)
-                }),
+                .map(|auth| BearerAuth(auth.into_scheme(), PhantomData))
+                .map_err(|_| AuthenticationError::default(req)),
         )
     }
 }
 
-impl AuthExtractor for BearerAuth {
-    type Future = Ready<Result<Self, Self::Error>>;
-    type Error = AuthenticationError<bearer::Bearer>;
-
+impl<B: CompleteErrorResponse> AuthExtractor for BearerAuth<B> {
     fn from_service_request(req: &ServiceRequest) -> Self::Future {
         ready(
             authorization::Authorization::<authorization::Bearer>::parse(req)
-                .map(|auth| BearerAuth(auth.into_scheme()))
-                .map_err(|_| {
-                    let bearer = req
-                        .app_data::<Config>()
-                        .map(|config| config.0.clone())
-                        .unwrap_or_else(Default::default);
-
-                    AuthenticationError::new(bearer)
-                }),
+                .map(|auth| BearerAuth(auth.into_scheme(), PhantomData))
+                .map_err(|_| AuthenticationError::default2(req)),
         )
     }
 }
 
 /// Extended error customization for HTTP `Bearer` auth.
-impl AuthenticationError<bearer::Bearer> {
+impl<B: CompleteErrorResponse> AuthenticationError<Config<B>> {
     /// Attach `Error` to the current Authentication error.
     ///
     /// Error status code will be changed to the one provided by the `kind`
